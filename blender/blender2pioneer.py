@@ -45,6 +45,30 @@ def doStatic():
         strMaterial += str(round(m.material.specular_color.b, 3)) + ","
         strMaterial += " 0, 0,0,0)"
         print(strMaterial)
+
+    # First build up vertex array
+    vertex = []
+    for v in bpy.context.active_object.data.vertices:
+        vertex.append(tuple(v.co))
+
+    # Quads
+    for f in bpy.context.active_object.data.faces:
+        if len(f.vertices) == 4:
+            strFace = "         quad("
+            strFace += "v" + str(vertex[f.vertices[0]]) + ","
+            strFace += "v" + str(vertex[f.vertices[1]]) + ","
+            strFace += "v" + str(vertex[f.vertices[2]]) + ","
+            strFace += "v" + str(vertex[f.vertices[3]])
+            strFace += ")"
+        elif len(f.vertices) == 3:
+            strFace = "         tri("
+            strFace += "v" + str(vertex[f.vertices[0]]) + ","
+            strFace += "v" + str(vertex[f.vertices[1]]) + ","
+            strFace += "v" + str(vertex[f.vertices[2]])
+            strFace += ")"
+
+        print(strFace)
+
     print("     end,")
 
 
@@ -60,7 +84,7 @@ def dump():
     print("     end,")
     # footer
     print("})")
-    
+
 class pioneerOperator(bpy.types.Operator):
     bl_idname = "export.pioneer"
     bl_label = "Export to pioneer"
