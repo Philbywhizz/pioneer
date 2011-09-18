@@ -1,6 +1,8 @@
 #ifndef _GEOSPHERE_H
 #define _GEOSPHERE_H
 
+#include <SDL_stdinc.h>
+
 #include "vector3.h"
 #include "mtrand.h"
 #include "GeoSphereStyle.h"
@@ -10,6 +12,7 @@ extern int GEOPATCH_EDGELEN;
 
 class SBody;
 class GeoPatch;
+class GeoPatchContext;
 class GeoSphere {
 public:
 	GeoSphere(const SBody *body);
@@ -17,6 +20,7 @@ public:
 	void Render(vector3d campos, const float radius, const float scale);
 	inline double GetHeight(vector3d p) {
 		const double h = m_style.GetHeight(p);
+		s_vtxGenCount++;
 #ifdef DEBUG
 		// XXX don't remove this. Fix your fractals instead
 		// Fractals absolutely MUST return heights >= 0.0 (one planet radius)
@@ -38,6 +42,8 @@ public:
 	}
 	// in sbody radii
 	double GetMaxFeatureHeight() const { return m_style.GetMaxHeight(); }
+	static int GetVtxGenCount() { return s_vtxGenCount; }
+	static void ClearVtxGenCount() { s_vtxGenCount = 0; }
 private:
 	void BuildFirstPatches();
 	GeoPatch *m_patches[6];
@@ -57,12 +63,23 @@ private:
 	void DestroyVBOs();
 	
 	vector3d m_tempCampos;
-	int m_runUpdateThread;
+
+	SDL_mutex *m_updateLock;
+
+	SDL_mutex *m_needUpdateLock;
+	bool m_needUpdate;
+
+	SDL_mutex *m_abortLock;
+	bool m_abort;
 	//////////////////////////////
 
 	inline vector3d GetColor(const vector3d &p, double height, const vector3d &norm) {
 		return m_style.GetColor(p, height, norm);
 	}
+
+	static int s_vtxGenCount;
+
+	static GeoPatchContext *s_patchContext;
 };
 
 #endif /* _GEOSPHERE_H */

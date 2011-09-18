@@ -28,7 +28,7 @@ ARG_SHIP_EQUIP_MISSILE4 = 16
 ARG_SHIP_EQUIP_MISSILE5 = 17
 ARG_SHIP_EQUIP_MISSILE6 = 18
 ARG_SHIP_EQUIP_MISSILE7 = 19
-ARG_SHIP_EQUIP_MISSILE8 = 20
+ARG_SHIP_FLIGHT_STATE = 20
 
 
 -- First some useful utility functions! :D
@@ -96,10 +96,11 @@ function lerp_materials(a, m1, m2)
 	return out
 end
 
---dofile "data/models/adverts.lua"
-load_lua(CurrentDirectory .. "/model_functions")
+--dofile "models/adverts.lua"
 load_lua(CurrentDirectory .. "/sub_models")
 load_lua(CurrentDirectory .. "/models")
+
+print("If you see Error IMG_Load below, delete your ~/.pioneer/model_cache folder.");
 
 poo = 0
 define_model('test', {

@@ -66,7 +66,7 @@ local onChat = function (form, ref, option)
 			return onClick(ref)
 		end,
 
-		-- do something when a "buy" button is clicked
+		-- do something when a "sell" button is clicked
 		onClickSell = function (ref, commodity)
 			return onClick(ref)
 		end,
@@ -81,8 +81,6 @@ local onChat = function (form, ref, option)
             ads[ref].stock[commodity] = ads[ref].stock[commodity] - 1
 		end,
 	})
-
-	form:AddOption("Hang up.", -1)
 
 end
 

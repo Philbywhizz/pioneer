@@ -5,9 +5,10 @@
 #include "LmrModel.h"
 #include "collider/collider.h"
 #include "perlin.h"
-#include "Render.h"
+#include "render/Render.h"
 #include "BufferObject.h"
 #include "LuaUtils.h"
+#include "TextureManager.h"
 #include <set>
 #include <algorithm>
 
@@ -238,6 +239,8 @@ static const LmrObjParams *s_curParams;
 static std::map<std::string, LmrModel*> s_models;
 static lua_State *sLua;
 static int s_numTrisRendered;
+static std::string s_cacheDir;
+static bool s_recompileAllModels = true;
 
 struct Vertex {
 	Vertex() : v(0.0), n(0.0), tex_u(0.0), tex_v(0.0) {}		// zero this shit to stop denormal-copying on resize
@@ -266,7 +269,25 @@ void UseProgram(LmrShader *shader, bool Textured = false) {
 	}
 }
 
-#define BUFFER_OFFSET(i) ((char *)NULL + (i))
+#define BUFFER_OFFSET(i) (reinterpret_cast<const GLvoid *>(i))
+
+static void _fwrite_string(const std::string &str, FILE *f)
+{
+	int len = str.size()+1;
+	fwrite(&len, sizeof(len), 1, f);
+	fwrite(str.c_str(), sizeof(char), len, f);
+}
+
+static std::string _fread_string(FILE *f)
+{
+	int len = 0;
+	fread_or_die(&len, sizeof(len), 1, f);
+	char *buf = new char[len];
+	fread_or_die(buf, sizeof(char), len, f);
+	std::string str = std::string(buf);
+	delete buf;
+	return str;
+}
 	
 class LmrGeomBuffer {
 public:
@@ -332,7 +353,7 @@ public:
 				if (op.elems.texture != 0 ) {
 					UseProgram(curShader, true);
 					glEnable(GL_TEXTURE_2D);
-					glBindTexture(GL_TEXTURE_2D, op.elems.texture);
+					op.elems.texture->BindTexture();
 				} else {
 					UseProgram(curShader, false);
 				}
@@ -357,8 +378,9 @@ public:
 			case OP_DRAW_BILLBOARDS:
 				// XXX not using vbo yet
 				Render::UnbindAllBuffers();
+				op.billboards.texture->BindTexture();
 				Render::PutPointSprites(op.billboards.count, &m_vertices[op.billboards.start].v, op.billboards.size,
-						op.billboards.col, op.billboards.tex, sizeof(Vertex));
+						op.billboards.col, sizeof(Vertex));
 				BindBuffers();
 				break;
 			case OP_SET_MATERIAL:
@@ -368,7 +390,7 @@ public:
 					glMaterialfv (GL_FRONT, GL_SPECULAR, m.specular);
 					glMaterialfv (GL_FRONT, GL_EMISSION, m.emissive);
 					glMaterialf (GL_FRONT, GL_SHININESS, m.shininess);
-					if (m.diffuse[3] == 1.0) {
+					if (m.diffuse[3] >= 1.0) {
 						glDisable(GL_BLEND);
 					} else {
 						glEnable(GL_BLEND);
@@ -376,7 +398,7 @@ public:
 				}
 				break;
 			case OP_ZBIAS:
-				if (op.zbias.amount == 0) {
+				if (float_is_zero_general(op.zbias.amount)) {
 					glDepthRange(0.0, 1.0);
 				} else {
 					vector3f tv = cameraPos - vector3f(op.zbias.pos);
@@ -510,7 +532,13 @@ public:
 			m_vertices[idx] = Vertex(pos, normal, tex_u, tex_v);
 		}
 	}
-	void SetTexture(GLuint tex) { curTexture = tex; }
+	void SetTexture(const char *tex) {
+		if (tex) {
+			curTexture = TextureManager::GetTexture(tex);
+		} else {
+			curTexture = 0;
+		}
+	}
 	void SetTexMatrix(const matrix4x4f &texMatrix) { curTexMatrix = texMatrix; } 
 	void PushTri(int i1, int i2, int i3) {
 		OpDrawElements(3);
@@ -581,13 +609,12 @@ public:
 	{
 		char buf[256];
 		snprintf(buf, sizeof(buf), PIONEER_DATA_DIR"/textures/%s", texname);
-		GLuint tex = util_load_tex_rgba(buf);
 
 		if (curOp.type) m_ops.push_back(curOp);
 		curOp.type = OP_DRAW_BILLBOARDS;
 		curOp.billboards.start = m_vertices.size();
 		curOp.billboards.count = numPoints;
-		curOp.billboards.tex = tex;
+		curOp.billboards.texture = TextureManager::GetTexture(buf, true);
 		curOp.billboards.size = size;
 		curOp.billboards.col[0] = color.x;
 		curOp.billboards.col[1] = color.y;
@@ -731,11 +758,11 @@ private:
 	struct Op {
 		enum OpType type;
 		union {
-			struct { int start, count, elemMin, elemMax; GLuint texture; } elems;
+			struct { Texture *texture; int start, count, elemMin, elemMax; } elems;
 			struct { int material_idx; } col;
 			struct { float amount; float pos[3]; float norm[3]; } zbias;
 			struct { LmrModel *model; float transform[16]; float scale; } callmodel;
-			struct { int start, count; GLuint tex; float size; float col[4]; } billboards;
+			struct { Texture *texture; int start, count; float size; float col[4]; } billboards;
 			struct { bool local; } lighting_type;
 			struct { int num; float quadratic_attenuation; float pos[4], col[4]; } light;
 		};
@@ -743,7 +770,7 @@ private:
 	/* this crap is only used at build time... could move this elsewhere */
 	Op curOp;
 	Uint16 curTriFlag;
-	GLuint curTexture;
+	Texture *curTexture;
 	matrix4x4f curTexMatrix;
 	// 
 	std::vector<Vertex> m_vertices;
@@ -756,6 +783,80 @@ private:
 	BufferObject<sizeof(Vertex)> *m_bo;
 	bool m_isStatic;
 	bool m_putGeomInsideout;
+
+public:
+	void SaveToCache(FILE *f) {
+		int numVertices = m_vertices.size();
+		int numIndices = m_indices.size();
+		int numTriflags = m_triflags.size();
+		int numThrusters = m_thrusters.size();
+		int numOps = m_ops.size();
+		fwrite(&numVertices, sizeof(numVertices), 1, f);
+		fwrite(&numIndices, sizeof(numIndices), 1, f);
+		fwrite(&numTriflags, sizeof(numTriflags), 1, f);
+		fwrite(&numThrusters, sizeof(numThrusters), 1, f);
+		fwrite(&numOps, sizeof(numOps), 1, f);
+		if (numVertices) fwrite(&m_vertices[0], sizeof(Vertex), numVertices, f);
+		if (numIndices) fwrite(&m_indices[0], sizeof(Uint16), numIndices, f);
+		if (numTriflags) fwrite(&m_triflags[0], sizeof(Uint16), numTriflags, f);
+		if (numThrusters) fwrite(&m_thrusters[0], sizeof(ShipThruster::Thruster), numThrusters, f);
+		if (numOps) {
+			for (int i=0; i<numOps; i++) {
+				fwrite(&m_ops[i], sizeof(Op), 1, f);
+				if (m_ops[i].type == OP_CALL_MODEL) {
+					_fwrite_string(m_ops[i].callmodel.model->GetName(), f);
+				}
+				else if ((m_ops[i].type == OP_DRAW_ELEMENTS) && (m_ops[i].elems.texture)) {
+					_fwrite_string(m_ops[i].elems.texture->GetFilename(), f);
+				}
+				else if ((m_ops[i].type == OP_DRAW_BILLBOARDS) && (m_ops[i].billboards.texture)) {
+					_fwrite_string(m_ops[i].billboards.texture->GetFilename(), f);
+				}
+			}
+		}
+	}
+	void LoadFromCache(FILE *f) {
+		int numVertices, numIndices, numTriflags, numThrusters, numOps;
+		fread_or_die(&numVertices, sizeof(numVertices), 1, f);
+		fread_or_die(&numIndices, sizeof(numIndices), 1, f);
+		fread_or_die(&numTriflags, sizeof(numTriflags), 1, f);
+		fread_or_die(&numThrusters, sizeof(numThrusters), 1, f);
+		fread_or_die(&numOps, sizeof(numOps), 1, f);
+		assert(numVertices <= 65536);
+		assert(numIndices < 1000000);
+		assert(numTriflags < 1000000);
+		assert(numThrusters < 1000);
+		assert(numOps < 1000);
+		if (numVertices) {
+			m_vertices.resize(numVertices);
+			fread_or_die(&m_vertices[0], sizeof(Vertex), numVertices, f);
+		}
+		if (numIndices) {
+			m_indices.resize(numIndices);
+			fread_or_die(&m_indices[0], sizeof(Uint16), numIndices, f);
+		}
+		if (numTriflags) {
+			m_triflags.resize(numTriflags);
+			fread_or_die(&m_triflags[0], sizeof(Uint16), numTriflags, f);
+		}
+		if (numThrusters) {
+			m_thrusters.resize(numThrusters);
+			fread_or_die(&m_thrusters[0], sizeof(ShipThruster::Thruster), numThrusters, f);
+		}
+		m_ops.resize(numOps);
+		for (int i=0; i<numOps; i++) {
+			fread_or_die(&m_ops[i], sizeof(Op), 1, f);
+			if (m_ops[i].type == OP_CALL_MODEL) {
+				m_ops[i].callmodel.model = s_models[_fread_string(f)];
+			}
+			else if ((m_ops[i].type == OP_DRAW_ELEMENTS) && (m_ops[i].elems.texture)) {
+				m_ops[i].elems.texture = TextureManager::GetTexture(_fread_string(f));
+			}
+			else if ((m_ops[i].type == OP_DRAW_BILLBOARDS) && (m_ops[i].billboards.texture)) {
+				m_ops[i].billboards.texture = TextureManager::GetTexture(_fread_string(f));
+			}
+		}
+	}
 };
 
 LmrModel::LmrModel(const char *model_name)
@@ -836,18 +937,63 @@ LmrModel::LmrModel(const char *model_name)
 		m_dynamicGeometry[i] = new LmrGeomBuffer(this, false);
 	}
 
-	for (int i=0; i<m_numLods; i++) {
-		m_staticGeometry[i]->PreBuild();
-		s_curBuf = m_staticGeometry[i];
-		lua_pushcfunction(sLua, pi_lua_panic);
-		// call model static building function
-		lua_getfield(sLua, LUA_GLOBALSINDEX, (m_name+"_static").c_str());
-		// lod as first argument
-		lua_pushnumber(sLua, i+1);
-		lua_pcall(sLua, 1, 0, -3);
-		lua_pop(sLua, 1);  // remove panic func
-		s_curBuf = 0;
-		m_staticGeometry[i]->PostBuild();
+	const std::string cache_file = join_path(s_cacheDir.c_str(), model_name, 0) + ".bin";
+
+	if (!s_recompileAllModels) {
+		// load cached model
+		FILE *f = fopen(cache_file.c_str(), "rb");
+		if (!f) goto rebuild_model;
+
+		for (int i=0; i<m_numLods; i++) {
+			m_staticGeometry[i]->PreBuild();
+			m_staticGeometry[i]->LoadFromCache(f);
+			m_staticGeometry[i]->PostBuild();
+		}
+		int numMaterials;
+		fread_or_die(&numMaterials, sizeof(numMaterials), 1, f);
+		if (size_t(numMaterials) != m_materials.size()) {
+			fclose(f);
+			goto rebuild_model;
+		}
+		if (numMaterials) fread_or_die(&m_materials[0], sizeof(LmrMaterial), numMaterials, f);
+
+		int numLights;
+		fread_or_die(&numLights, sizeof(numLights), 1, f);
+		if (size_t(numLights) != m_lights.size()) {
+			fclose(f);
+			goto rebuild_model;
+		}
+		if (numLights) fread_or_die(&m_lights[0], sizeof(LmrLight), numLights, f);
+
+		fclose(f);
+	} else {
+rebuild_model:
+		// run static build for each LOD level
+		FILE *f = fopen(cache_file.c_str(), "wb");
+		
+		for (int i=0; i<m_numLods; i++) {
+			m_staticGeometry[i]->PreBuild();
+			s_curBuf = m_staticGeometry[i];
+			lua_pushcfunction(sLua, pi_lua_panic);
+			// call model static building function
+			lua_getfield(sLua, LUA_GLOBALSINDEX, (m_name+"_static").c_str());
+			// lod as first argument
+			lua_pushnumber(sLua, i+1);
+			lua_pcall(sLua, 1, 0, -3);
+			lua_pop(sLua, 1);  // remove panic func
+			s_curBuf = 0;
+			m_staticGeometry[i]->PostBuild();
+			m_staticGeometry[i]->SaveToCache(f);
+		}
+		
+		const int numMaterials = m_materials.size();
+		fwrite(&numMaterials, sizeof(numMaterials), 1, f);
+		if (numMaterials) fwrite(&m_materials[0], sizeof(LmrMaterial), numMaterials, f);
+		const int numLights = m_lights.size();
+		fwrite(&numLights, sizeof(numLights), 1, f);
+		if (numLights) fwrite(&m_lights[0], sizeof(LmrLight), numLights, f);
+		
+		fclose(f);
 	}
 }
 
@@ -909,7 +1055,7 @@ int LmrModel::GetIntAttribute(const char *attr_name) const
 	snprintf(buf, sizeof(buf), "%s_info", m_name.c_str());
 	lua_getglobal(sLua, buf);
 	lua_getfield(sLua, -1, attr_name);
-	int result = luaL_checkint(sLua, -1);
+	int result = luaL_checkinteger(sLua, -1);
 	lua_pop(sLua, 2);
 	return result;
 }
@@ -1022,7 +1168,7 @@ int LmrCollMesh::GetTrisWithGeomflag(unsigned int flags, int num, vector3d *outV
 {
 	int found = 0;
 	for (int i=0; (i<m_numTris) && (found<num); i++) {
-		if (pFlag[i] == int(flags)) {
+		if (pFlag[i] == flags) {
 			*(outVtx++) = vector3d(&pVertex[3*pIndex[3*i]]);
 			*(outVtx++) = vector3d(&pVertex[3*pIndex[3*i+1]]);
 			*(outVtx++) = vector3d(&pVertex[3*pIndex[3*i+2]]);
@@ -1083,7 +1229,7 @@ namespace ModelFuncs {
 
 	static int set_light(lua_State *L)
 	{
-		int num = luaL_checkint(L, 1)-1;
+		int num = luaL_checkinteger(L, 1)-1;
 		if ((num < 0) || (num > 3)) {
 			luaL_error(L, "set_light should have light number from 1 to 4.");
 		}
@@ -1096,7 +1242,7 @@ namespace ModelFuncs {
 
 	static int use_light(lua_State *L)
 	{
-		int num = luaL_checkint(L, 1)-1;
+		int num = luaL_checkinteger(L, 1)-1;
 		s_curBuf->PushUseLight(num);
 		return 0;
 	}
@@ -1117,7 +1263,7 @@ namespace ModelFuncs {
 
 	static int lathe(lua_State *L)
 	{
-		const int steps = luaL_checknumber(L, 1);
+		const int steps = luaL_checkinteger(L, 1);
 		const vector3f *start = MyLuaVec::checkVec(L, 2);
 		const vector3f *end = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -1152,7 +1298,7 @@ namespace ModelFuncs {
 			const float rad2 = jizz[i+3];
 			const vector3d _start = *start + (*end-*start)*jizz[i];
 			const vector3d _end = *start + (*end-*start)*jizz[i+2];
-			bool shitty_normal = (jizz[i] == jizz[i+2]);
+			bool shitty_normal = float_equal_absolute(jizz[i], jizz[i+2], 1e-4f);
 
 			const int basevtx = vtxStart + steps*i;
 			float ang = 0;
@@ -1409,7 +1555,7 @@ namespace ModelFuncs {
 	static void _bezier_triangle(lua_State *L, bool xref)
 	{
 		vector3f pts[10];
-		const int divs = luaL_checkint(L, 1) + 1;
+		const int divs = luaL_checkinteger(L, 1) + 1;
 		assert(divs > 0);
 		if (BEZIER_ORDER == 2) {
 			for (int i=0; i<6; i++) {
@@ -1499,8 +1645,8 @@ namespace ModelFuncs {
 	static void _quadric_bezier_quad(lua_State *L, bool xref)
 	{
 		vector3f pts[9];
-		const int divs_u = luaL_checkint(L, 1);
-		const int divs_v = luaL_checkint(L, 2);
+		const int divs_u = luaL_checkinteger(L, 1);
+		const int divs_v = luaL_checkinteger(L, 2);
 		for (int i=0; i<9; i++) {
 			pts[i] = *MyLuaVec::checkVec(L, i+3);
 		}
@@ -1572,8 +1718,8 @@ namespace ModelFuncs {
 	static void _cubic_bezier_quad(lua_State *L, bool xref)
 	{
 		vector3f pts[16];
-		const int divs_v = luaL_checkint(L, 1);
-		const int divs_u = luaL_checkint(L, 2);
+		const int divs_v = luaL_checkinteger(L, 1);
+		const int divs_u = luaL_checkinteger(L, 2);
 		if (lua_istable(L, 3)) {
 			for (int i=0; i<16; i++) {
 				lua_pushinteger(L, i+1);
@@ -1678,7 +1824,6 @@ namespace ModelFuncs {
 
 			const char *texfile = luaL_checkstring(L, 1);
 			std::string t = dir + std::string("/") + texfile;
-			GLuint texture = util_load_tex_rgba(t.c_str());
 			if (nargs == 4) {
 				// texfile, pos, uaxis, vaxis
 				vector3f pos = *MyLuaVec::checkVec(L, 2);
@@ -1692,7 +1837,7 @@ namespace ModelFuncs {
 				s_curBuf->SetTexMatrix(trans);
 			}
 
-			s_curBuf->SetTexture(texture);
+			s_curBuf->SetTexture(t.c_str());
 		}
 		return 0;
 	}
@@ -1759,20 +1904,20 @@ namespace ModelFuncs {
 	
 	static int geomflag(lua_State *L)
 	{
-		Uint16 flag = luaL_checkint(L, 1);
+		Uint16 flag = luaL_checkinteger(L, 1);
 		s_curBuf->SetGeomFlag(flag);
 		return 0;
 	}
 
 	static int zbias(lua_State *L)
 	{
-		float amount = luaL_checknumber(L, 1);
-		if (amount == 0) {
+		int amount = luaL_checkinteger(L, 1);
+		if (! amount) {
 			s_curBuf->PushZBias(0, vector3f(0.0), vector3f(0.0));
 		} else {
 			vector3f *pos = MyLuaVec::checkVec(L, 2);
 			vector3f *norm = MyLuaVec::checkVec(L, 3);
-			s_curBuf->PushZBias(amount, *pos, *norm);
+			s_curBuf->PushZBias(float(amount), *pos, *norm);
 		}
 		return 0;
 	}
@@ -1799,7 +1944,7 @@ namespace ModelFuncs {
 
 	static int circle(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		const vector3f *center = MyLuaVec::checkVec(L, 2);
 		const vector3f *normal = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -1810,7 +1955,7 @@ namespace ModelFuncs {
 
 	static int xref_circle(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		vector3f center = *MyLuaVec::checkVec(L, 2);
 		vector3f normal = *MyLuaVec::checkVec(L, 3);
 		vector3f updir = *MyLuaVec::checkVec(L, 4);
@@ -1883,7 +2028,7 @@ namespace ModelFuncs {
 	
 	static int tube(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		const vector3f *start = MyLuaVec::checkVec(L, 2);
 		const vector3f *end = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -1895,7 +2040,7 @@ namespace ModelFuncs {
 
 	static int xref_tube(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		vector3f start = *MyLuaVec::checkVec(L, 2);
 		vector3f end = *MyLuaVec::checkVec(L, 3);
 		vector3f updir = *MyLuaVec::checkVec(L, 4);
@@ -1949,7 +2094,7 @@ namespace ModelFuncs {
 	
 	static int tapered_cylinder(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		const vector3f *start = MyLuaVec::checkVec(L, 2);
 		const vector3f *end = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -1962,7 +2107,7 @@ namespace ModelFuncs {
 	static int xref_tapered_cylinder(lua_State *L)
 	{
 		/* could optimise for x-reflection but fuck it */
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		vector3f start = *MyLuaVec::checkVec(L, 2);
 		vector3f end = *MyLuaVec::checkVec(L, 3);
 		vector3f updir = *MyLuaVec::checkVec(L, 4);
@@ -2013,7 +2158,7 @@ namespace ModelFuncs {
 	
 	static int cylinder(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		const vector3f *start = MyLuaVec::checkVec(L, 2);
 		const vector3f *end = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -2025,7 +2170,7 @@ namespace ModelFuncs {
 	static int xref_cylinder(lua_State *L)
 	{
 		/* could optimise for x-reflection but fuck it */
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		vector3f start = *MyLuaVec::checkVec(L, 2);
 		vector3f end = *MyLuaVec::checkVec(L, 3);
 		vector3f updir = *MyLuaVec::checkVec(L, 4);
@@ -2068,7 +2213,7 @@ namespace ModelFuncs {
 	/* Cylinder with no top or bottom caps */
 	static int ring(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		const vector3f *start = MyLuaVec::checkVec(L, 2);
 		const vector3f *end = MyLuaVec::checkVec(L, 3);
 		const vector3f *updir = MyLuaVec::checkVec(L, 4);
@@ -2079,7 +2224,7 @@ namespace ModelFuncs {
 
 	static int xref_ring(lua_State *L)
 	{
-		int steps = luaL_checkint(L, 1);
+		int steps = luaL_checkinteger(L, 1);
 		vector3f start = *MyLuaVec::checkVec(L, 2);
 		vector3f end = *MyLuaVec::checkVec(L, 3);
 		vector3f updir = *MyLuaVec::checkVec(L, 4);
@@ -2211,7 +2356,7 @@ namespace ModelFuncs {
 	static int get_arg(lua_State *L)
 	{
 		assert(s_curParams != 0);
-		int i = luaL_checkint(L, 1);
+		int i = luaL_checkinteger(L, 1);
 		lua_pushnumber(L, s_curParams->argDoubles[i]);
 		return 1;
 	}
@@ -2219,7 +2364,7 @@ namespace ModelFuncs {
 	static int get_arg_string(lua_State *L)
 	{
 		assert(s_curParams != 0);
-		int i = luaL_checkint(L, 1);
+		int i = luaL_checkinteger(L, 1);
 		if (s_curParams->argStrings[i])
 			lua_pushstring(L, s_curParams->argStrings[i]);
 		else
@@ -2230,7 +2375,7 @@ namespace ModelFuncs {
 	static int get_arg_material(lua_State *L)
 	{
 		assert(s_curParams != 0);
-		int n = luaL_checkint(L, 1);
+		int n = luaL_checkinteger(L, 1);
 		lua_createtable (L, 11, 0);
 
 		const LmrMaterial &mat = s_curParams->pMat[n];
@@ -2330,7 +2475,7 @@ namespace ModelFuncs {
 	{
 		int i, subdivs;
 		matrix4x4f trans;
-		subdivs = luaL_checkint(l, 1);
+		subdivs = luaL_checkinteger(l, 1);
 		if ((subdivs < 0) || (subdivs > 4)) {
 			luaL_error(l, "sphere(subdivs, transform): subdivs must be in range [0,4]");
 		}
@@ -2360,8 +2505,8 @@ namespace ModelFuncs {
 		int LAT_SEGS;
 		int LONG_SEGS;
 		float sliceAngle1, sliceAngle2;
-		LONG_SEGS = luaL_checkint(l, 1);
-		LAT_SEGS = luaL_checkint(l, 2);
+		LONG_SEGS = luaL_checkinteger(l, 1);
+		LAT_SEGS = luaL_checkinteger(l, 2);
 		sliceAngle1 = luaL_checknumber(l, 3);
 		sliceAngle2 = luaL_checknumber(l, 4);
 			//luaL_error(l, "sphere(subdivs, transform): subdivs must be in range [0,4]");
@@ -2495,7 +2640,7 @@ namespace ObjLoader {
 		std::vector<vector3f> texcoords;
 		std::vector<vector3f> normals;
 		std::map<std::string, std::string> mtl_map;
-		GLuint texture = 0;
+		std::string texture;
 
 		// maps obj file vtx_idx,norm_idx to a single GeomBuffer vertex index
 		std::map< std::pair<int,int>, int> vtxmap;
@@ -2571,7 +2716,7 @@ namespace ObjLoader {
 							s_curBuf->SetVertex(vtxStart+1, b, n, texcoords[ti[i+1]].x, texcoords[ti[i+1]].y);
 							s_curBuf->SetVertex(vtxStart+2, c, n, texcoords[ti[i+2]].x, texcoords[ti[i+2]].y);
 						}
-						if (texture) s_curBuf->SetTexture(texture);
+						if (texture.size()) s_curBuf->SetTexture(texture.c_str());
 						s_curBuf->PushTri(vtxStart, vtxStart+1, vtxStart+2);
 					}
 				} else {
@@ -2593,7 +2738,7 @@ namespace ObjLoader {
 							realVtxIdx[i] = (*it).second;
 						}
 					}
-					if (texture) s_curBuf->SetTexture(texture);
+					if (texture.size()) s_curBuf->SetTexture(texture.c_str());
 					if (numBits == 3) {
 						s_curBuf->PushTri(realVtxIdx[0], realVtxIdx[1], realVtxIdx[2]);
 					} else if (numBits == 4) {
@@ -2617,7 +2762,7 @@ namespace ObjLoader {
 						try {
 							char texfile[256];
 							snprintf(texfile, sizeof(texfile), "%s/%s", curdir.c_str(), mtl_map[mat_name].c_str());
-							texture = util_load_tex_rgba(texfile);
+							texture = texfile;
 						} catch (LmrUnknownMaterial) {
 							printf("Warning: Missing material %s (%s) in %s\n", mtl_map[mat_name].c_str(), mat_name, obj_name);
 						}
@@ -2664,6 +2809,11 @@ static int define_model(lua_State *L)
 		return 0;
 	}
 
+	if (s_models.find(model_name) != s_models.end()) {
+		fprintf(stderr, "attempt to redefine model %s\n", model_name);
+		return 0;
+	}
+
 	// table is passed containing info, static and dynamic, which are
 	// functions. we then stuff them into the globals, named
 	// modelName_info, _static, etc.
@@ -2688,8 +2838,62 @@ static int define_model(lua_State *L)
 	return 0;
 }
 
+static Uint32 s_allModelFilesCRC = 0;
+static void _makeModelFilesCRC(const std::string &dir, const std::string &filename)
+{
+	struct stat info;
+	if (stat(filename.c_str(), &info)) return;
+
+	if (S_ISDIR(info.st_mode)) {
+		foreach_file_in(filename, &_makeModelFilesCRC);
+	} else if (S_ISREG(info.st_mode) && (filename.substr(filename.size()-4) != ".png")) {
+		FILE *f = fopen(filename.c_str(), "rb");
+		if (f) {
+			for (int c = 0;;) {
+				c = fgetc(f);
+				if (c != EOF) s_allModelFilesCRC += c;
+				else break;
+			}
+			fclose(f);
+		}
+	}
+}
+
+static void _detect_model_changes()
+{
+
+	// do we need to rebuild the model cache?
+	foreach_file_in(PIONEER_DATA_DIR "/models", &_makeModelFilesCRC);
+
+	FILE *cache_sum_file = fopen(join_path(s_cacheDir.c_str(), "cache.sum", 0).c_str(), "rb");
+	if (cache_sum_file) {
+		if ((_fread_string(cache_sum_file) == PIONEER_VERSION) &&
+		    (_fread_string(cache_sum_file) == PIONEER_EXTRAVERSION)) {
+			Uint32 crc;
+			fread_or_die(&crc, sizeof(crc), 1, cache_sum_file);
+			if (crc == s_allModelFilesCRC) {
+				s_recompileAllModels = false;
+			}
+		}
+		fclose(cache_sum_file);
+	}
+	if (s_recompileAllModels) {
+		printf("Rebuilding model cache...\n");
+		cache_sum_file = fopen(join_path(s_cacheDir.c_str(), "cache.sum", 0).c_str(), "wb");
+		if (cache_sum_file) {
+			_fwrite_string(PIONEER_VERSION, cache_sum_file);
+			_fwrite_string(PIONEER_EXTRAVERSION, cache_sum_file);
+			fwrite(&s_allModelFilesCRC, sizeof(s_allModelFilesCRC), 1, cache_sum_file);
+			fclose(cache_sum_file);
+		}
+	}
+}
+
 void LmrModelCompilerInit()
 {
+	s_cacheDir = GetPiUserDir("model_cache");
+	_detect_model_changes();
+
 	s_staticBufferPool = new BufferObjectPool<sizeof(Vertex)>();
 	s_sunlightShader[0] = new LmrShader("model", "#define NUM_LIGHTS 1\n");
 	s_sunlightShader[1] = new LmrShader("model", "#define NUM_LIGHTS 2\n");

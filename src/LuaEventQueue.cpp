@@ -67,7 +67,7 @@ void LuaEventQueueBase::EmitSingleEvent(LuaEventBase *e)
 	while (lua_next(l, -2) != 0) {
 		int top = lua_gettop(l);
 		PrepareLuaStack(l, e);
-		lua_call(l, lua_gettop(l) - top, 0);
+		pi_lua_protected_call(l, lua_gettop(l) - top, 0);
 	}
 
 	lua_pop(l, 2);
@@ -98,7 +98,7 @@ void LuaEventQueueBase::Emit()
 		while (lua_next(l, -2) != 0) {
 			int top = lua_gettop(l);
 			PrepareLuaStack(l, e);
-			lua_call(l, lua_gettop(l) - top, 0);
+			pi_lua_protected_call(l, lua_gettop(l) - top, 0);
 		}
 
 		delete e;
@@ -231,6 +231,29 @@ void LuaEventQueueBase::Emit()
  *   stable
  *
  *
+ * Event: onFrameChanged
+ *
+ * Triggered as a dynamic <Body> moves between frames of reference.
+ *
+ * > local onFrameChanged = function (body) ... end
+ * > EventQueue.onFrameChanged:Connect(onFrameChanged)
+ *
+ * Details of the new frame itself can be obtained from the body's
+ * <Body.frameBody> and <Body.frameRotating> attributes.
+ *
+ * Parameters:
+ *
+ *   body - the dynamic <Body> that changed frames
+ *
+ * Availability:
+ *
+ *   alpha 12
+ *
+ * Status:
+ *
+ *   experimental
+ *
+ *
  * Event: onShipDestroyed
  *
  * Triggered when a ship is destroyed.
@@ -351,6 +374,52 @@ void LuaEventQueueBase::Emit()
  * Status:
  *
  *   stable
+ *
+ *
+ * Event: onShipLanded
+ *
+ * Triggered when a ship performs a surface landing
+ * (not on a spaceport).
+ *
+ * > local onShipLanded = function (ship, body) ... end
+ * > EventQueue.onShipLanded:Connect(onShipLanded)
+ *
+ * Parameters:
+ *
+ *   ship - the <Ship> that landed
+ *
+ *   body - the <Body> the ship landed on
+ *
+ * Availability:
+ *
+ *   alpha 13
+ *
+ * Status:
+ *
+ *   experimental
+ *
+ *
+ * Event: onShipTakeOff
+ *
+ * Triggered when a ship takes off from a surface
+ * (not from a spaceport).
+ *
+ * > local onBlastOff = function (ship, body) ... end
+ * > EventQueue.onShipTakeOff:Connect(onBlastOff)
+ *
+ * Parameters:
+ *
+ *   ship - the <Ship> that took off
+ *
+ *   body - the <Body> the ship took off from
+ *
+ * Availability:
+ *
+ *   alpha 13
+ *
+ * Status:
+ *
+ *   experimental
  *
  *
  * Event: onShipAlertChanged
@@ -492,7 +561,7 @@ void LuaEventQueueBase::Emit()
  * Example:
  *
  * > EventQueue.onEnterSystem:Connect(function (ship)
- * >     print("welcome to "..Game.system:GetName()..", "..ship:GetLabel())
+ * >     print("welcome to "..Game.system.name..", "..ship.label)
  * > end)
  *
  * Availability:
@@ -532,7 +601,7 @@ int LuaEventQueueBase::l_connect(lua_State *l)
  * Disconnects a function from an event queue. The function will no long
  * receive events emitted by the queue.
  *
- * If the function is not connected to the queue this method does nothihg.
+ * If the function is not connected to the queue this method does nothing.
  *
  * > onEvent:Disconnect(function)
  *
